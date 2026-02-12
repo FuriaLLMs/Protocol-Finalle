@@ -3,6 +3,7 @@ import logging
 import json
 import base64
 import functools
+import time
 from typing import Optional, cast, Callable, Dict
 from datetime import datetime, timedelta, timezone
 
@@ -11,6 +12,7 @@ from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
+from src.security.utils import generate_ephemeral_cert
 
 from aioquic.asyncio import QuicConnectionProtocol, serve
 from aioquic.quic.configuration import QuicConfiguration
@@ -83,13 +85,24 @@ class TacticalProtocol(QuicConnectionProtocol):
             sender_pubkey = base64.b64decode(sender_pubkey_b64)
             signature = base64.b64decode(signature_b64)
 
+            # --- REPLAY PROTECTION ---
+            timestamp = payload.get("timestamp")
+            if not timestamp:
+                 logger.warning(f"{Fore.RED}⚠️  Packet missing timestamp. potential REPLAY or LEGACY.{Style.RESET_ALL}")
+                 return
+
+            if abs(time.time() - timestamp) > 60:
+                 logger.warning(f"{Fore.RED}⚠️  EXPIRED PACKET (Replay Protection). Delta: {time.time() - timestamp:.2f}s{Style.RESET_ALL}")
+                 return
+            # -------------------------
+
             # 2. Verify Signature
             # For HANDSHAKE: Payload is the raw JSON string of the payload dict? 
             # OR we reconstruct the bytes. The client must sign consistent bytes.
             # Decision: The client signs the concatenated values of key fields in payload.
             # To be robust, let's assume the client signs:
-            # HANDSHAKE: node_id + dilithium_pk + kyber_pk + port (as string/bytes)
-            # MESSAGE: kyber_capsule + aes_nonce + ciphertext
+            # HANDSHAKE: node_id + dilithium_pk + kyber_pk + timestamp (as string/bytes)
+            # MESSAGE: kyber_capsule + aes_nonce + ciphertext + timestamp
             
             body_to_verify = b""
             
@@ -107,13 +120,24 @@ class TacticalProtocol(QuicConnectionProtocol):
                 dilithium_pk = base64.b64decode(dilithium_pk_b64)
                 kyber_pk = base64.b64decode(kyber_pk_b64)
                 
-                body_to_verify = node_id.encode('utf-8') + dilithium_pk + kyber_pk
+                body_to_verify = (
+                    node_id.encode('utf-8') + 
+                    dilithium_pk + 
+                    kyber_pk + 
+                    str(timestamp).encode('utf-8')
+                )
                 
             elif msg_type == "MESSAGE":
                 kyber_capsule = base64.b64decode(payload.get("kyber_capsule", ""))
                 aes_nonce = base64.b64decode(payload.get("aes_nonce", ""))
                 ciphertext = base64.b64decode(payload.get("ciphertext", ""))
-                body_to_verify = kyber_capsule + aes_nonce + ciphertext
+                
+                body_to_verify = (
+                    kyber_capsule + 
+                    aes_nonce + 
+                    ciphertext +
+                    str(timestamp).encode('utf-8')
+                )
             
             # Verify
             is_valid = QuantumIdentity.verify_signature(
@@ -211,31 +235,8 @@ class TacticalProtocol(QuicConnectionProtocol):
             logger.error(f"Decryption failed: {e}")
 
 
-def generate_ephemeral_cert() -> QuicConfiguration:
-    """
-    Generates a self-signed certificate and private key in MEMORY ONLY.
-    """
-    logger.info("Generating ephemeral TLS certificate (RAM Only)...")
-    private_key = ec.generate_private_key(ec.SECP256R1())
-    subject = issuer = x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, u"Tactical Node"),
-    ])
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(private_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.now(timezone.utc))
-        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=1))
-        .add_extension(x509.SubjectAlternativeName([x509.DNSName(u"localhost")]), critical=False)
-        .sign(private_key, hashes.SHA256())
-    )
-    configuration = QuicConfiguration(is_client=False, alpn_protocols=["tactical-v1"])
-    configuration.certificate = cert
-    configuration.private_key = private_key
-    configuration.verify_mode = 0 # ssl.CERT_NONE
-    return configuration
+# Removed generate_ephemeral_cert (Moved to src.security.utils)
+
 
 async def start_node(
     host: str, 

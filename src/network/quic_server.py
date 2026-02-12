@@ -16,6 +16,7 @@ from aioquic.asyncio import QuicConnectionProtocol, serve
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import QuicEvent, StreamDataReceived
 
+from src.core.peer_manager import PeerManager
 from src.core.identity import QuantumIdentity
 from src.core.encryption import QuantumEncryption
 from colorama import Fore, Style, init
@@ -30,30 +31,28 @@ class TacticalProtocol(QuicConnectionProtocol):
     """
     Protocol handler for the Tactical P2P Network (JSON/Base64).
     Handles encrypted streams over UDP/QUIC.
+    Supports: HANDSHAKE and MESSAGE types.
     """
     def __init__(self, *args, 
                  identity_module: Optional[QuantumIdentity] = None,
                  encryption_module: Optional[QuantumEncryption] = None,
+                 peer_manager: Optional[PeerManager] = None,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.identity_module = identity_module
         self.encryption_module = encryption_module
+        self.peer_manager = peer_manager
         self.buffer = b""
 
     def quic_event_received(self, event: QuicEvent):
         if isinstance(event, StreamDataReceived):
             self.buffer += event.data
-            
-            # Attempt to process buffer (Expect JSON)
             try:
-                # We assume one message per stream for simplicity in this tactical protocol
-                # If we were doing continuous streams, we'd need length prefixing or delimiters
                 message_str = self.buffer.decode('utf-8')
                 packet = json.loads(message_str)
                 self._process_json_packet(packet)
-                self.buffer = b"" # Reset buffer after success
+                self.buffer = b"" 
             except json.JSONDecodeError:
-                # Incomplete data or invalid JSON, wait for more
                 pass
             except Exception as e:
                 logger.error(f"Error processing packet: {e}")
@@ -61,20 +60,17 @@ class TacticalProtocol(QuicConnectionProtocol):
 
     def _process_json_packet(self, packet: Dict):
         """
-        Processes a JSON tactical packet.
-        Expected Format:
-        {
-          "sender_id": "Base64_PublicKey",
-          "signature": "Base64_Sig",
-          "payload": {
-             "kyber_capsule": "Base64...",
-             "aes_nonce": "Base64...",
-             "ciphertext": "Base64..."
-          }
-        }
+        Processes a JSON tactical packet (HANDSHAKE or MESSAGE).
+        
+        Common Fields:
+        - type: "HANDSHAKE" | "MESSAGE"
+        - sender_id: Base64 Dilithium PubKey
+        - signature: Base64 Signature of payload
+        - payload: Dict (Content varies by type)
         """
         try:
-            # 1. Extract and Decode Fields
+            # 1. Extract Common Fields
+            msg_type = packet.get("type", "MESSAGE") # Default to MESSAGE for backward compat if needed
             sender_pubkey_b64 = packet.get("sender_id")
             signature_b64 = packet.get("signature")
             payload = packet.get("payload", {})
@@ -84,19 +80,40 @@ class TacticalProtocol(QuicConnectionProtocol):
 
             sender_pubkey = base64.b64decode(sender_pubkey_b64)
             signature = base64.b64decode(signature_b64)
-            
-            kyber_capsule = base64.b64decode(payload.get("kyber_capsule", ""))
-            aes_nonce = base64.b64decode(payload.get("aes_nonce", ""))
-            ciphertext = base64.b64decode(payload.get("ciphertext", ""))
-            
-            if not (kyber_capsule and aes_nonce and ciphertext):
-                raise ValueError("Incomplete payload.")
 
-            # 2. Verify Signature (Dilithium)
-            # Reconstruct the body that was signed: Capsule + Nonce + Ciphertext
-            # This ensures the crypto materials verify against the signature
-            body_to_verify = kyber_capsule + aes_nonce + ciphertext
+            # 2. Verify Signature
+            # For HANDSHAKE: Payload is the raw JSON string of the payload dict? 
+            # OR we reconstruct the bytes. The client must sign consistent bytes.
+            # Decision: The client signs the concatenated values of key fields in payload.
+            # To be robust, let's assume the client signs:
+            # HANDSHAKE: node_id + dilithium_pk + kyber_pk + port (as string/bytes)
+            # MESSAGE: kyber_capsule + aes_nonce + ciphertext
             
+            body_to_verify = b""
+            
+            if msg_type == "HANDSHAKE":
+                # Reconstruct bytes: node_id + dilithium_pk + kyber_pk
+                # (Assuming strict ordering or specific format from client)
+                # Let's simplify: Client signs the Dumped JSON of payload? No, canonical JSON is hard.
+                # Client signs: node_id.encode() + dilithium_pk (bytes) + kyber_pk (bytes)
+                
+                # Extract fields
+                node_id = payload.get("node_id", "")
+                dilithium_pk_b64 = payload.get("dilithium_pk", "")
+                kyber_pk_b64 = payload.get("kyber_pk", "")
+                
+                dilithium_pk = base64.b64decode(dilithium_pk_b64)
+                kyber_pk = base64.b64decode(kyber_pk_b64)
+                
+                body_to_verify = node_id.encode('utf-8') + dilithium_pk + kyber_pk
+                
+            elif msg_type == "MESSAGE":
+                kyber_capsule = base64.b64decode(payload.get("kyber_capsule", ""))
+                aes_nonce = base64.b64decode(payload.get("aes_nonce", ""))
+                ciphertext = base64.b64decode(payload.get("ciphertext", ""))
+                body_to_verify = kyber_capsule + aes_nonce + ciphertext
+            
+            # Verify
             is_valid = QuantumIdentity.verify_signature(
                 data=body_to_verify,
                 signature=signature,
@@ -104,30 +121,64 @@ class TacticalProtocol(QuicConnectionProtocol):
             )
             
             if not is_valid:
-                logger.warning(f"{Fore.RED}⚠️  INVALID SIGNATURE from {sender_pubkey_b64[:8]}... Dropping.{Style.RESET_ALL}")
+                logger.warning(f"{Fore.RED}⚠️  INVALID SIGNATURE ({msg_type}) from {sender_pubkey_b64[:8]}... Dropping.{Style.RESET_ALL}")
                 return
 
-            # 3. Decrypt (Kyber + AES)
-            if not self.encryption_module:
-                logger.error("Encryption module not initialized.")
-                return
-                
+            # 3. Process by Type
+            if msg_type == "HANDSHAKE":
+                self._handle_handshake(sender_pubkey_b64, payload, dilithium_pk, kyber_pk)
+            elif msg_type == "MESSAGE":
+                self._handle_message(sender_pubkey_b64, payload)
+
+        except Exception as e:
+            logger.error(f"Packet processing failed: {e}")
+
+    def _handle_handshake(self, sender_id: str, payload: Dict, d_pk: bytes, k_pk: bytes):
+        node_id = payload.get("node_id")
+        port = payload.get("listening_port")
+        # We don't easily know the sender's IP here without accessing transport info, 
+        # but for this context let's assume we might get it from transport or payload.
+        # In aioquic, transport.get_extra_info('peername') gives (ip, port).
+        # We'll just placeholder IP logging for now or assume it's the connected peer.
+        
+        print(f"\n{Fore.CYAN}🤝 HANDSHAKE RECEIVED{Style.RESET_ALL}")
+        print(f"Node ID: {node_id}")
+        print(f"Kyber PK: {len(k_pk)} bytes")
+        
+        if self.peer_manager:
+            try:
+                # Mock IP for now as we are inside protocol, or use 'Unknown'
+                self.peer_manager.add_peer(node_id, "0.0.0.0", port, d_pk, k_pk)
+                print(f"{Fore.GREEN}✅ NEW ALLY ADDED: {node_id[:8]}...{Style.RESET_ALL}")
+            except Exception as e:
+                logger.error(f"Failed to add peer: {e}")
+        
+        print(f"CMD > ", end="", flush=True)
+
+    def _handle_message(self, sender_id: str, payload: Dict):
+        # ... Decryption Logic ...
+        kyber_capsule = base64.b64decode(payload.get("kyber_capsule", ""))
+        aes_nonce = base64.b64decode(payload.get("aes_nonce", ""))
+        ciphertext = base64.b64decode(payload.get("ciphertext", ""))
+        
+        if not self.encryption_module:
+            return
+
+        try:
             decrypt_bundle = {
                 'kyber_capsule': kyber_capsule,
                 'aes_nonce': aes_nonce,
                 'ciphertext': ciphertext
             }
-            
             plaintext = self.encryption_module.decrypt_message(decrypt_bundle)
             
-            # 4. Success Output
             print(f"\n{Fore.GREEN}⚡ TACTICAL MESSAGE RECEIVED ⚡{Style.RESET_ALL}")
-            print(f"{Fore.CYAN}FROM:{Style.RESET_ALL} {sender_pubkey_b64[:16]}...")
+            print(f"{Fore.CYAN}FROM:{Style.RESET_ALL} {sender_id[:16]}...")
             print(f"{Fore.GREEN}MSG :{Style.RESET_ALL} {plaintext}\n")
-            print(f"CMD > ", end="", flush=True) # Restore prompt
-            
+            print(f"CMD > ", end="", flush=True)
         except Exception as e:
-            logger.error(f"Packet processing failed: {e}")
+            logger.error(f"Decryption failed: {e}")
+
 
 def generate_ephemeral_cert() -> QuicConfiguration:
     """
@@ -159,7 +210,8 @@ async def start_node(
     host: str, 
     port: int,
     identity_module: Optional[QuantumIdentity] = None,
-    encryption_module: Optional[QuantumEncryption] = None
+    encryption_module: Optional[QuantumEncryption] = None,
+    peer_manager: Optional[PeerManager] = None
 ):
     """
     Starts the QUIC server node.
@@ -175,7 +227,8 @@ async def start_node(
     protocol_factory = functools.partial(
         TacticalProtocol, 
         identity_module=identity_module,
-        encryption_module=encryption_module
+        encryption_module=encryption_module,
+        peer_manager=peer_manager
     )
 
     await serve(

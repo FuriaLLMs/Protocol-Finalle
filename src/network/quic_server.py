@@ -1,6 +1,7 @@
 import asyncio
 import logging
-import struct
+import json
+import base64
 import functools
 from typing import Optional, cast, Callable, Dict
 from datetime import datetime, timedelta, timezone
@@ -17,13 +18,17 @@ from aioquic.quic.events import QuicEvent, StreamDataReceived
 
 from src.core.identity import QuantumIdentity
 from src.core.encryption import QuantumEncryption
+from colorama import Fore, Style, init
+
+# Initialize colorama
+init(autoreset=True)
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 class TacticalProtocol(QuicConnectionProtocol):
     """
-    Protocol handler for the Tactical P2P Network.
+    Protocol handler for the Tactical P2P Network (JSON/Base64).
     Handles encrypted streams over UDP/QUIC.
     """
     def __init__(self, *args, 
@@ -39,108 +44,100 @@ class TacticalProtocol(QuicConnectionProtocol):
         if isinstance(event, StreamDataReceived):
             self.buffer += event.data
             
-            # Attempt to process buffer if we have enough data
+            # Attempt to process buffer (Expect JSON)
             try:
-                self._process_packet()
+                # We assume one message per stream for simplicity in this tactical protocol
+                # If we were doing continuous streams, we'd need length prefixing or delimiters
+                message_str = self.buffer.decode('utf-8')
+                packet = json.loads(message_str)
+                self._process_json_packet(packet)
+                self.buffer = b"" # Reset buffer after success
+            except json.JSONDecodeError:
+                # Incomplete data or invalid JSON, wait for more
+                pass
             except Exception as e:
-                # If error is just "not enough data", we wait for more.
-                # If it's a parsing error, we log it.
-                if "Not enough data" not in str(e):
-                    logger.error(f"Error processing packet: {e}")
-                    self.buffer = b"" # Clear bad buffer
+                logger.error(f"Error processing packet: {e}")
+                self.buffer = b""
 
-    def _process_packet(self):
+    def _process_json_packet(self, packet: Dict):
         """
-        Parses and decrypts the P2P packet.
-        Format:
-        [SENDER_PUBKEY_LEN (4B)] + [SENDER_PUBKEY] + 
-        [SIGNATURE_LEN (4B)]     + [SIGNATURE] + 
-        [CIPHERTEXT_LEN (4B)]    + [CIPHERTEXT] + 
-        [PAYLOAD (Encrypted msg)]
+        Processes a JSON tactical packet.
+        Expected Format:
+        {
+          "sender_id": "Base64_PublicKey",
+          "signature": "Base64_Sig",
+          "payload": {
+             "kyber_capsule": "Base64...",
+             "aes_nonce": "Base64...",
+             "ciphertext": "Base64..."
+          }
+        }
         """
-        data = self.buffer
-        offset = 0
-
-        # Helper to read N bytes
-        def read(n):
-            nonlocal offset
-            if offset + n > len(data):
-                raise ValueError("Not enough data")
-            res = data[offset : offset + n]
-            offset += n
-            return res
-
-        # 1. Parse Sender PubKey
-        pubkey_len = struct.unpack("!I", read(4))[0]
-        sender_pubkey = read(pubkey_len)
-
-        # 2. Parse Signature
-        sig_len = struct.unpack("!I", read(4))[0]
-        signature = read(sig_len)
-
-        # 3. Parse Ciphertext
-        ct_len = struct.unpack("!I", read(4))[0]
-        ciphertext = read(ct_len)
-
-        # 4. Get Payload (Rest of buffer for now, assuming one packet per stream)
-        # Note: In a continuous stream, we'd need a payload length field.
-        # For this PoC using quick streams, we take the rest.
-        encrypted_payload = data[offset:]
-        if len(encrypted_payload) == 0:
-             raise ValueError("Not enough data (No payload)")
-
-        # --- VERIFICATION & DECRYPTION ---
-
-        # A. Verify Signature (Dilithium)
-        # Signature covers: Ciphertext + EncryptedPayload
-        body_to_verify = ciphertext + encrypted_payload
-        
-        # We need a way to verify using the bytes we received.
-        # QuantumIdentity.verify_signature is static.
-        is_valid = QuantumIdentity.verify_signature(body_to_verify, signature, sender_pubkey)
-        
-        if not is_valid:
-            logger.warning("Packet signature verification FAILED. Dropping.")
-            return
-
-        logger.info(f"Signature Verified (Sender: {sender_pubkey[:8].hex()}...)")
-
-        # B. Decapsulate (Kyber)
-        if not self.encryption_module:
-            logger.error("No encryption module available to decrypt.")
-            return
-
         try:
-            shared_secret = self.encryption_module.decapsulate(ciphertext)
-            logger.debug("Decapsulation successful. Shared secret derived.")
-        except Exception as e:
-            logger.error(f"Decapsulation failed: {e}")
-            return
+            # 1. Extract and Decode Fields
+            sender_pubkey_b64 = packet.get("sender_id")
+            signature_b64 = packet.get("signature")
+            payload = packet.get("payload", {})
+            
+            if not (sender_pubkey_b64 and signature_b64 and payload):
+                raise ValueError("Incomplete packet structure.")
 
-        # C. Decrypt Payload (AES-GCM)
-        try:
-            plaintext = QuantumEncryption.decrypt_message(encrypted_payload, shared_secret)
-            logger.info(f"MESSAGE RECEIVED: {plaintext}")
-            # Reset buffer only after successful processing
-            self.buffer = b"" 
+            sender_pubkey = base64.b64decode(sender_pubkey_b64)
+            signature = base64.b64decode(signature_b64)
+            
+            kyber_capsule = base64.b64decode(payload.get("kyber_capsule", ""))
+            aes_nonce = base64.b64decode(payload.get("aes_nonce", ""))
+            ciphertext = base64.b64decode(payload.get("ciphertext", ""))
+            
+            if not (kyber_capsule and aes_nonce and ciphertext):
+                raise ValueError("Incomplete payload.")
+
+            # 2. Verify Signature (Dilithium)
+            # Reconstruct the body that was signed: Capsule + Nonce + Ciphertext
+            # This ensures the crypto materials verify against the signature
+            body_to_verify = kyber_capsule + aes_nonce + ciphertext
+            
+            is_valid = QuantumIdentity.verify_signature(
+                data=body_to_verify,
+                signature=signature,
+                public_key=sender_pubkey
+            )
+            
+            if not is_valid:
+                logger.warning(f"{Fore.RED}⚠️  INVALID SIGNATURE from {sender_pubkey_b64[:8]}... Dropping.{Style.RESET_ALL}")
+                return
+
+            # 3. Decrypt (Kyber + AES)
+            if not self.encryption_module:
+                logger.error("Encryption module not initialized.")
+                return
+                
+            decrypt_bundle = {
+                'kyber_capsule': kyber_capsule,
+                'aes_nonce': aes_nonce,
+                'ciphertext': ciphertext
+            }
+            
+            plaintext = self.encryption_module.decrypt_message(decrypt_bundle)
+            
+            # 4. Success Output
+            print(f"\n{Fore.GREEN}⚡ TACTICAL MESSAGE RECEIVED ⚡{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}FROM:{Style.RESET_ALL} {sender_pubkey_b64[:16]}...")
+            print(f"{Fore.GREEN}MSG :{Style.RESET_ALL} {plaintext}\n")
+            print(f"CMD > ", end="", flush=True) # Restore prompt
+            
         except Exception as e:
-            logger.error(f"Decryption failed: {e}")
+            logger.error(f"Packet processing failed: {e}")
 
 def generate_ephemeral_cert() -> QuicConfiguration:
     """
     Generates a self-signed certificate and private key in MEMORY ONLY.
     """
     logger.info("Generating ephemeral TLS certificate (RAM Only)...")
-    
-    # 1. Generate Private Key (Elliptic Curve - SECP256R1)
     private_key = ec.generate_private_key(ec.SECP256R1())
-    
-    # 2. Generate Self-Signed Certificate
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME, u"Tactical Node"),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"Resistance P2P"),
     ])
-    
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -149,25 +146,13 @@ def generate_ephemeral_cert() -> QuicConfiguration:
         .serial_number(x509.random_serial_number())
         .not_valid_before(datetime.now(timezone.utc))
         .not_valid_after(datetime.now(timezone.utc) + timedelta(days=1))
-        .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(u"localhost")]),
-            critical=False,
-        )
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(u"localhost")]), critical=False)
         .sign(private_key, hashes.SHA256())
     )
-
-    # 3. Create QuicConfiguration
-    # Note: alpn_protocols is required for QUIC
-    configuration = QuicConfiguration(
-        is_client=False,
-        alpn_protocols=["tactical-v1"]
-    )
-
-    # 4. Inject Keys directly into configuration (Bypassing disk I/O)
+    configuration = QuicConfiguration(is_client=False, alpn_protocols=["tactical-v1"])
     configuration.certificate = cert
     configuration.private_key = private_key
-    
-    logger.info("Ephemeral certificate generated and loaded.")
+    configuration.verify_mode = 0 # ssl.CERT_NONE
     return configuration
 
 async def start_node(
@@ -179,18 +164,20 @@ async def start_node(
     """
     Starts the QUIC server node.
     """
+    if encryption_module:
+        pub_key_b64 = encryption_module.export_public_key()
+        print(f"\n{Fore.YELLOW}=== SERVER STARTED ==={Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}KYBER PUBLIC KEY:{Style.RESET_ALL} {pub_key_b64}")
+        print(f"{Fore.YELLOW}Listening on {host}:{port} (UDP/QUIC)...{Style.RESET_ALL}\n")
+
     configuration = generate_ephemeral_cert()
     
-    logger.info(f"Starting QUIC Server on {host}:{port} (UDP)")
-    
-    # Create a partial to inject our modules into the protocol constructor
     protocol_factory = functools.partial(
         TacticalProtocol, 
         identity_module=identity_module,
         encryption_module=encryption_module
     )
 
-    # serve creates the datagram endpoint
     await serve(
         host,
         port,
@@ -198,13 +185,8 @@ async def start_node(
         create_protocol=protocol_factory,
     )
     
-    # Keep running
     await asyncio.Future()
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    try:
-        # Run server on localhost:4433
-        asyncio.run(start_node("127.0.0.1", 4433))
-    except KeyboardInterrupt:
-        logger.info("Server stopped.")
+    # Test Entry point
+    asyncio.run(start_node("127.0.0.1", 4433))

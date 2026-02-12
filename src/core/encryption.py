@@ -1,6 +1,7 @@
 import os
 import base64
-from typing import Tuple
+import hashlib
+from typing import Tuple, Dict
 
 # Post-Quantum Key Encapsulation (Kyber-512 / ML-KEM-512)
 from pqcrypto.kem import ml_kem_512
@@ -10,11 +11,12 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 class QuantumEncryption:
     """
-    Quantum-resistant hybrid encryption scheme.
+    Quantum-resistant hybrid encryption scheme (Centralized).
     
     Mechanisms:
-    1. Key Encapsulation: Kyber-512 (ML-KEM-512) establishes a shared secret.
-    2. Data Encryption: AES-256-GCM uses the shared secret to encrypt payload.
+    1. Key Encapsulation: Kyber-512 (ML-KEM-512) -> Shared Secret.
+    2. Key Derivation: SHA-256(Shared Secret) -> AES-256 Key.
+    3. Data Encryption: AES-256-GCM.
     
     SECURITY CRITICAL:
     - Secret keys (`self.secret_key`) are kept in RAM only.
@@ -29,94 +31,88 @@ class QuantumEncryption:
         # secret_key: Used by US to decrypt incoming messages.
         self.public_key, self.secret_key = ml_kem_512.generate_keypair()
         
-    def encapsulate(self, remote_public_key: bytes) -> Tuple[bytes, bytes]:
-        """
-        Generates a shared secret for a specific recipient.
-        
-        Args:
-            remote_public_key (bytes): The recipient's Kyber public key.
-            
-        Returns:
-            ciphertext (bytes): The encapsulated key (send this to recipient).
-            shared_secret (bytes): The symmetric key (keep this secret).
-        """
-        # Library uses 'encrypt' for encapsulation
-        ciphertext, shared_secret = ml_kem_512.encrypt(remote_public_key)
-        return ciphertext, shared_secret
+    def export_public_key(self) -> str:
+        """Returns Base64 encoded public key."""
+        return base64.b64encode(self.public_key).decode('utf-8')
 
-    def decapsulate(self, ciphertext: bytes) -> bytes:
+    def encrypt_message(self, target_public_key: bytes, message_text: str) -> Dict[str, bytes]:
         """
-        Recovers the shared secret from an encapsulated ciphertext.
+        High-level encryption function.
+        Generates ephemeral keys, encrypts the message, and returns all needed artifacts.
         
         Args:
-            ciphertext (bytes): The encapsulated key received from sender.
+            target_public_key (bytes): Recipient's Kyber public key.
+            message_text (str): Plaintext message.
             
         Returns:
-            shared_secret (bytes): The symmetric key.
+            dict: {
+                'kyber_capsule': bytes,  # Encapsulated key (send to specific target)
+                'aes_nonce': bytes,      # 12-byte IV for AES-GCM
+                'ciphertext': bytes      # Encrypted message payload (includes tag)
+            }
+        """
+        # 1. Kyber Encapsulation (Key Exchange)
+        # Generates 'capsule' (to send) and 'shared_secret' (keep hidden)
+        kyber_capsule, shared_secret_raw = ml_kem_512.encrypt(target_public_key)
+        
+        # 2. Key Derivation (HKDF is better, but SHA256 is sufficient for this scope)
+        # We ensure the AES key is exactly 32 bytes (256 bits)
+        aes_key = hashlib.sha256(shared_secret_raw).digest()
+        
+        # 3. Symmetric Encryption (AES-GCM)
+        nonce = os.urandom(12) # Standard 96-bit nonce
+        aesgcm = AESGCM(aes_key)
+        
+        # AESGCM.encrypt returns ciphertext + tag
+        ciphertext = aesgcm.encrypt(nonce, message_text.encode('utf-8'), None)
+        
+        return {
+            'kyber_capsule': kyber_capsule,
+            'aes_nonce': nonce,
+            'ciphertext': ciphertext
+        }
+
+    def decrypt_message(self, packet: Dict[str, bytes]) -> str:
+        """
+        High-level decryption function.
+        
+        Args:
+            packet (dict): Must contain 'kyber_capsule', 'aes_nonce', 'ciphertext'.
+            
+        Returns:
+            str: Decrypted plaintext message.
             
         Raises:
-            ValueError: If decryption fails (implicit checks in Kyber).
+            RuntimeError: If secret key is missing.
+            ValueError/InvalidTag: If decryption fails (Bad key or tampering).
         """
         if not self.secret_key or all(b == 0 for b in self.secret_key):
              raise RuntimeError("Secret key has been wiped from memory.")
 
-        # Library uses 'decrypt' for decapsulation
-        return ml_kem_512.decrypt(self.secret_key, ciphertext)
+        kyber_capsule = packet.get('kyber_capsule')
+        aes_nonce = packet.get('aes_nonce')
+        ciphertext = packet.get('ciphertext')
+        
+        if not (kyber_capsule and aes_nonce and ciphertext):
+            raise ValueError("Incomplete packet dictionary.")
 
-    @staticmethod
-    def encrypt_message(message: str, shared_secret: bytes) -> bytes:
-        """
-        Encrypts a message using AES-GCM with the derived shared secret.
-        
-        Args:
-            message (str): Plaintext message.
-            shared_secret (bytes): Symmetric key (32 bytes).
-            
-        Returns:
-            bytes: Nonce (12 bytes) + Ciphertext + Tag (16 bytes).
-        """
-        # AESGCM requires 12-byte nonce
-        nonce = os.urandom(12)
-        
-        # Initialize AES-GCM with the shared secret
-        aesgcm = AESGCM(shared_secret)
-        
-        # Encrypt
-        ciphertext_with_tag = aesgcm.encrypt(nonce, message.encode('utf-8'), None)
-        
-        # Return bundled packet
-        return nonce + ciphertext_with_tag
+        # 1. Kyber Decapsulation
+        # Recover the raw shared secret using our private key
+        try:
+            shared_secret_raw = ml_kem_512.decrypt(self.secret_key, kyber_capsule)
+        except Exception as e:
+            raise ValueError(f"Kyber decapsulation failed: {e}")
 
-    @staticmethod
-    def decrypt_message(encrypted_data: bytes, shared_secret: bytes) -> str:
-        """
-        Decrypts a message using AES-GCM.
+        # 2. Key Derivation (Must match encrypt_message)
+        aes_key = hashlib.sha256(shared_secret_raw).digest()
         
-        Args:
-            encrypted_data (bytes): Nonce + Ciphertext + Tag.
-            shared_secret (bytes): Symmetric key.
-            
-        Returns:
-            str: Decrypted plaintext.
-            
-        Raises:
-            InvalidTag: If integrity check fails.
-        """
-        # Extract nonce
-        nonce = encrypted_data[:12]
-        ciphertext_with_tag = encrypted_data[12:]
+        # 3. Symmetric Decryption
+        aesgcm = AESGCM(aes_key)
         
-        # Initialize AES-GCM
-        aesgcm = AESGCM(shared_secret)
-        
-        # Decrypt
-        plaintext_bytes = aesgcm.decrypt(nonce, ciphertext_with_tag, None)
+        # Decrypt (Raises InvalidTag if integrity check fails)
+        plaintext_bytes = aesgcm.decrypt(aes_nonce, ciphertext, None)
         
         return plaintext_bytes.decode('utf-8')
-
-    def export_public_key(self) -> str:
-        """Returns Base64 encoded public key."""
-        return base64.b64encode(self.public_key).decode('utf-8')
 
     def wipe_memory(self):
         """Destroys the secret key in memory."""

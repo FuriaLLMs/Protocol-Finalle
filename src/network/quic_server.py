@@ -37,11 +37,13 @@ class TacticalProtocol(QuicConnectionProtocol):
                  identity_module: Optional[QuantumIdentity] = None,
                  encryption_module: Optional[QuantumEncryption] = None,
                  peer_manager: Optional[PeerManager] = None,
+                 listening_port: int = 4433,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.identity_module = identity_module
         self.encryption_module = encryption_module
         self.peer_manager = peer_manager
+        self.listening_port = listening_port
         self.buffer = b""
 
     def quic_event_received(self, event: QuicEvent):
@@ -136,22 +138,51 @@ class TacticalProtocol(QuicConnectionProtocol):
     def _handle_handshake(self, sender_id: str, payload: Dict, d_pk: bytes, k_pk: bytes):
         node_id = payload.get("node_id")
         port = payload.get("listening_port")
-        # We don't easily know the sender's IP here without accessing transport info, 
-        # but for this context let's assume we might get it from transport or payload.
-        # In aioquic, transport.get_extra_info('peername') gives (ip, port).
-        # We'll just placeholder IP logging for now or assume it's the connected peer.
         
+        # Determine Sender IP from transport
+        # connection.get_extra_info('peername') returns (ip, port)
+        # We need the IP to reply back.
+        peer_ip = "127.0.0.1" # Fallback
+        try:
+            if self._transport:
+                peer_info = self._transport.get_extra_info('peername')
+                if peer_info:
+                    peer_ip = peer_info[0]
+        except Exception:
+            pass
+
         print(f"\n{Fore.CYAN}🤝 HANDSHAKE RECEIVED{Style.RESET_ALL}")
         print(f"Node ID: {node_id}")
         print(f"Kyber PK: {len(k_pk)} bytes")
+        print(f"Peer IP: {peer_ip}:{port}")
         
         if self.peer_manager:
             try:
-                # Mock IP for now as we are inside protocol, or use 'Unknown'
-                self.peer_manager.add_peer(node_id, "0.0.0.0", port, d_pk, k_pk)
-                print(f"{Fore.GREEN}✅ NEW ALLY ADDED: {node_id[:8]}...{Style.RESET_ALL}")
+                # Check if peer is new
+                existing_peer = self.peer_manager.get_peer(node_id)
+                
+                # Add/Update Peer
+                self.peer_manager.add_peer(node_id, peer_ip, port, d_pk, k_pk)
+                print(f"{Fore.GREEN}✅ ALLY REGISTERED: {node_id[:8]}...{Style.RESET_ALL}")
+                
+                # If peer was NEW, send OUR keys back (Auto-Handshake)
+                if not existing_peer and self.identity_module and self.encryption_module:
+                    print(f"{Fore.YELLOW}>> SENDING HANDSHAKE REPLY to {peer_ip}:{port}...{Style.RESET_ALL}")
+                    
+                    # Import here to avoid circular dependency
+                    from src.network.p2p_client import send_handshake
+                    
+                    # Launch background task for reply
+                    asyncio.create_task(send_handshake(
+                        target_ip=peer_ip,
+                        target_port=port,
+                        my_identity=self.identity_module,
+                        my_encryption=self.encryption_module,
+                        listening_port=self.listening_port
+                    ))
+                    
             except Exception as e:
-                logger.error(f"Failed to add peer: {e}")
+                logger.error(f"Failed to add/reply peer: {e}")
         
         print(f"CMD > ", end="", flush=True)
 
@@ -228,7 +259,8 @@ async def start_node(
         TacticalProtocol, 
         identity_module=identity_module,
         encryption_module=encryption_module,
-        peer_manager=peer_manager
+        peer_manager=peer_manager,
+        listening_port=port
     )
 
     await serve(
